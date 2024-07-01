@@ -17,7 +17,9 @@ use std::{
 use common::{connected_server, default_server, generate_ticket};
 use neqo_common::{hex_with_len, qdebug, qtrace, Datagram, Encoder, Role};
 use neqo_crypto::AuthenticationStatus;
-use neqo_transport::{server::ValidateAddress, CloseReason, Error, State, StreamType};
+use neqo_transport::{
+    server::ValidateAddress, CloseReason, Error, State, StreamType, MIN_INITIAL_PACKET_SIZE,
+};
 use test_fixture::{
     assertions, datagram, default_client,
     header_protection::{
@@ -154,13 +156,7 @@ fn retry_different_ip() {
     let dgram = dgram.unwrap();
     let other_v4 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
     let other_addr = SocketAddr::new(other_v4, 443);
-    let from_other = Datagram::new(
-        other_addr,
-        dgram.destination(),
-        dgram.tos(),
-        dgram.ttl(),
-        &dgram[..],
-    );
+    let from_other = Datagram::new(other_addr, dgram.destination(), dgram.tos(), &dgram[..]);
     let dgram = server.process(Some(&from_other), now()).dgram();
     assert!(dgram.is_none());
 }
@@ -181,13 +177,7 @@ fn new_token_different_ip() {
     // Now rewrite the source address.
     let d = dgram.unwrap();
     let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), d.source().port());
-    let dgram = Some(Datagram::new(
-        src,
-        d.destination(),
-        d.tos(),
-        d.ttl(),
-        &d[..],
-    ));
+    let dgram = Some(Datagram::new(src, d.destination(), d.tos(), &d[..]));
     let dgram = server.process(dgram.as_ref(), now()).dgram(); // Retry
     assert!(dgram.is_some());
     assertions::assert_retry(dgram.as_ref().unwrap());
@@ -212,13 +202,7 @@ fn new_token_expired() {
     let the_future = now() + Duration::from_secs(60 * 60 * 24 * 30);
     let d = dgram.unwrap();
     let src = SocketAddr::new(d.source().ip(), d.source().port() + 1);
-    let dgram = Some(Datagram::new(
-        src,
-        d.destination(),
-        d.tos(),
-        d.ttl(),
-        &d[..],
-    ));
+    let dgram = Some(Datagram::new(src, d.destination(), d.tos(), &d[..]));
     let dgram = server.process(dgram.as_ref(), the_future).dgram(); // Retry
     assert!(dgram.is_some());
     assertions::assert_retry(dgram.as_ref().unwrap());
@@ -279,13 +263,7 @@ fn retry_bad_integrity() {
 
     let mut tweaked = retry.to_vec();
     tweaked[retry.len() - 1] ^= 0x45; // damage the auth tag
-    let tweaked_packet = Datagram::new(
-        retry.source(),
-        retry.destination(),
-        retry.tos(),
-        retry.ttl(),
-        tweaked,
-    );
+    let tweaked_packet = Datagram::new(retry.source(), retry.destination(), retry.tos(), tweaked);
 
     // The client should ignore this packet.
     let dgram = client.process(Some(&tweaked_packet), now()).dgram();
@@ -331,7 +309,7 @@ fn retry_after_pto() {
     // Let PTO fire on the client and then let it exhaust its PTO packets.
     now += Duration::from_secs(1);
     let pto = client.process(None, now).dgram();
-    assert!(pto.unwrap().len() >= 1200);
+    assert!(pto.unwrap().len() >= MIN_INITIAL_PACKET_SIZE);
     let cb = client.process(None, now).callback();
     assert_ne!(cb, Duration::new(0, 0));
 
@@ -339,7 +317,7 @@ fn retry_after_pto() {
     assertions::assert_retry(retry.as_ref().unwrap());
 
     let ci2 = client.process(retry.as_ref(), now).dgram();
-    assert!(ci2.unwrap().len() >= 1200);
+    assert!(ci2.unwrap().len() >= MIN_INITIAL_PACKET_SIZE);
 }
 
 #[test]
@@ -430,11 +408,11 @@ fn mitm_retry() {
     qtrace!("notoken_header={}", hex_with_len(&notoken_header));
 
     // Encrypt.
-    let mut notoken_packet = Encoder::with_capacity(1200)
+    let mut notoken_packet = Encoder::with_capacity(MIN_INITIAL_PACKET_SIZE)
         .encode(&notoken_header)
         .as_ref()
         .to_vec();
-    notoken_packet.resize_with(1200, u8::default);
+    notoken_packet.resize_with(MIN_INITIAL_PACKET_SIZE, u8::default);
     aead.encrypt(
         pn,
         &notoken_header,
@@ -443,7 +421,7 @@ fn mitm_retry() {
     )
     .unwrap();
     // Unlike with decryption, don't truncate.
-    // All 1200 bytes are needed to reach the minimum datagram size.
+    // All MIN_INITIAL_PACKET_SIZE bytes are needed to reach the minimum datagram size.
 
     apply_header_protection(&hp, &mut notoken_packet, pn_offset..(pn_offset + pn_len));
     qtrace!("packet={}", hex_with_len(&notoken_packet));
@@ -452,7 +430,6 @@ fn mitm_retry() {
         client_initial2.source(),
         client_initial2.destination(),
         client_initial2.tos(),
-        client_initial2.ttl(),
         notoken_packet,
     );
     qdebug!("passing modified Initial to the main server");

@@ -7,7 +7,9 @@
 mod common;
 
 use neqo_common::{Datagram, Decoder, Encoder, Role};
-use neqo_transport::{CloseReason, ConnectionParameters, Error, State, Version};
+use neqo_transport::{
+    CloseReason, ConnectionParameters, Error, State, Version, MIN_INITIAL_PACKET_SIZE,
+};
 use test_fixture::{
     default_client, default_server,
     header_protection::{
@@ -40,7 +42,6 @@ fn truncate_long_packet() {
         dupe.source(),
         dupe.destination(),
         dupe.tos(),
-        dupe.ttl(),
         &dupe[..(dupe.len() - tail)],
     );
     let hs_probe = client.process(Some(&truncated), now()).dgram();
@@ -104,7 +105,7 @@ fn reorder_server_initial() {
 
     // And rebuild a packet.
     let mut packet = header.clone();
-    packet.resize(1200, 0);
+    packet.resize(MIN_INITIAL_PACKET_SIZE, 0);
     aead.encrypt(pn, &header, &plaintext, &mut packet[header.len()..])
         .unwrap();
     apply_header_protection(&hp, &mut packet, protected_header.len()..header.len());
@@ -112,7 +113,6 @@ fn reorder_server_initial() {
         server_initial.source(),
         server_initial.destination(),
         server_initial.tos(),
-        server_initial.ttl(),
         packet,
     );
 
@@ -158,7 +158,6 @@ fn set_payload(server_packet: &Option<Datagram>, client_dcid: &[u8], payload: &[
         server_initial.source(),
         server_initial.destination(),
         server_initial.tos(),
-        server_initial.ttl(),
         packet,
     )
 }
@@ -237,7 +236,7 @@ fn overflow_crypto() {
         let plen = payload.len();
         payload.pad_to(plen + 1000, 44);
 
-        let mut packet = Encoder::with_capacity(1200);
+        let mut packet = Encoder::with_capacity(MIN_INITIAL_PACKET_SIZE);
         packet
             .encode_byte(0xc1) // Initial with packet number length of 2.
             .encode_uint(4, Version::Version1.wire_version())
@@ -254,19 +253,18 @@ fn overflow_crypto() {
         aead.encrypt(pn, &header, payload.as_ref(), &mut packet[header.len()..])
             .unwrap();
         apply_header_protection(&hp, &mut packet, pn_offset..(pn_offset + 2));
-        packet.resize(1200, 0); // Initial has to be 1200 bytes!
+        packet.resize(MIN_INITIAL_PACKET_SIZE, 0); // Initial has to be MIN_INITIAL_PACKET_SIZE bytes!
 
         let dgram = Datagram::new(
             server_initial.source(),
             server_initial.destination(),
             server_initial.tos(),
-            server_initial.ttl(),
             packet,
         );
         client.process_input(&dgram, now());
         if let State::Closing { error, .. } = client.state() {
             assert!(
-                matches!(error, CloseReason::Transport(Error::CryptoBufferExceeded),),
+                matches!(error, CloseReason::Transport(Error::CryptoBufferExceeded)),
                 "the connection need to abort on crypto buffer"
             );
             assert!(pn > 64, "at least 64000 bytes of data is buffered");
@@ -274,4 +272,27 @@ fn overflow_crypto() {
         }
     }
     panic!("Was not able to overflow the crypto buffer");
+}
+
+#[test]
+fn test_handshake_xyber() {
+    let mut client = default_client();
+    let mut server = default_server();
+
+    client
+        .set_groups(&[neqo_crypto::TLS_GRP_KEM_XYBER768D00])
+        .ok();
+    client.send_additional_key_shares(0).ok();
+
+    test_fixture::handshake(&mut client, &mut server);
+    assert_eq!(*client.state(), State::Confirmed);
+    assert_eq!(*server.state(), State::Confirmed);
+    assert_eq!(
+        client.tls_info().unwrap().key_exchange(),
+        neqo_crypto::TLS_GRP_KEM_XYBER768D00
+    );
+    assert_eq!(
+        server.tls_info().unwrap().key_exchange(),
+        neqo_crypto::TLS_GRP_KEM_XYBER768D00
+    );
 }

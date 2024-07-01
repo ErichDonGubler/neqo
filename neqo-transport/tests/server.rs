@@ -16,6 +16,7 @@ use neqo_crypto::{
 use neqo_transport::{
     server::{ActiveConnectionRef, Server, ValidateAddress},
     CloseReason, Connection, ConnectionParameters, Error, Output, State, StreamType, Version,
+    MIN_INITIAL_PACKET_SIZE,
 };
 use test_fixture::{
     assertions, datagram, default_client,
@@ -157,7 +158,6 @@ fn duplicate_initial_new_path() {
         SocketAddr::new(initial.source().ip(), initial.source().port() ^ 23),
         initial.destination(),
         initial.tos(),
-        initial.ttl(),
         &initial[..],
     );
 
@@ -227,14 +227,14 @@ fn drop_non_initial() {
     let mut server = default_server();
 
     // This is big enough to look like an Initial, but it uses the Retry type.
-    let mut header = neqo_common::Encoder::with_capacity(1200);
+    let mut header = neqo_common::Encoder::with_capacity(MIN_INITIAL_PACKET_SIZE);
     header
         .encode_byte(0xfa)
         .encode_uint(4, Version::default().wire_version())
         .encode_vec(1, CID)
         .encode_vec(1, CID);
     let mut bogus_data: Vec<u8> = header.into();
-    bogus_data.resize(1200, 66);
+    bogus_data.resize(MIN_INITIAL_PACKET_SIZE, 66);
 
     let bogus = datagram(bogus_data);
     assert!(server.process(Some(&bogus), now()).dgram().is_none());
@@ -372,13 +372,7 @@ fn new_token_different_port() {
     // Now rewrite the source port, which should not change that the token is OK.
     let d = dgram.unwrap();
     let src = SocketAddr::new(d.source().ip(), d.source().port() + 1);
-    let dgram = Some(Datagram::new(
-        src,
-        d.destination(),
-        d.tos(),
-        d.ttl(),
-        &d[..],
-    ));
+    let dgram = Some(Datagram::new(src, d.destination(), d.tos(), &d[..]));
     let dgram = server.process(dgram.as_ref(), now()).dgram(); // Retry
     assert!(dgram.is_some());
     assertions::assert_initial(dgram.as_ref().unwrap(), false);
@@ -425,21 +419,15 @@ fn bad_client_initial() {
         )
         .unwrap();
     assert_eq!(header_enc.len() + v.len(), ciphertext.len());
-    // Pad with zero to get up to 1200.
-    ciphertext.resize(1200, 0);
+    // Pad with zero to get up to MIN_INITIAL_PACKET_SIZE.
+    ciphertext.resize(MIN_INITIAL_PACKET_SIZE, 0);
 
     apply_header_protection(
         &hp,
         &mut ciphertext,
         (header_enc.len() - 1)..header_enc.len(),
     );
-    let bad_dgram = Datagram::new(
-        dgram.source(),
-        dgram.destination(),
-        dgram.tos(),
-        dgram.ttl(),
-        ciphertext,
-    );
+    let bad_dgram = Datagram::new(dgram.source(), dgram.destination(), dgram.tos(), ciphertext);
 
     // The server should reject this.
     let response = server.process(Some(&bad_dgram), now());
@@ -488,7 +476,7 @@ fn bad_client_initial_connection_close() {
     let (aead, hp) = initial_aead_and_hp(d_cid, Role::Client);
     let (_, pn) = remove_header_protection(&hp, header, payload);
 
-    let mut payload_enc = Encoder::with_capacity(1200);
+    let mut payload_enc = Encoder::with_capacity(MIN_INITIAL_PACKET_SIZE);
     payload_enc.encode(&[0x1c, 0x01, 0x00, 0x00]); // Add a CONNECTION_CLOSE frame.
 
     // Make a new header with a 1 byte packet number length.
@@ -513,21 +501,15 @@ fn bad_client_initial_connection_close() {
         )
         .unwrap();
     assert_eq!(header_enc.len() + v.len(), ciphertext.len());
-    // Pad with zero to get up to 1200.
-    ciphertext.resize(1200, 0);
+    // Pad with zero to get up to MIN_INITIAL_PACKET_SIZE.
+    ciphertext.resize(MIN_INITIAL_PACKET_SIZE, 0);
 
     apply_header_protection(
         &hp,
         &mut ciphertext,
         (header_enc.len() - 1)..header_enc.len(),
     );
-    let bad_dgram = Datagram::new(
-        dgram.source(),
-        dgram.destination(),
-        dgram.tos(),
-        dgram.ttl(),
-        ciphertext,
-    );
+    let bad_dgram = Datagram::new(dgram.source(), dgram.destination(), dgram.tos(), ciphertext);
 
     // The server should ignore this and go to Draining.
     let mut now = now();
@@ -550,7 +532,6 @@ fn version_negotiation_ignored() {
         dgram.source(),
         dgram.destination(),
         dgram.tos(),
-        dgram.ttl(),
         input.clone(),
     );
     let vn = server.process(Some(&damaged), now()).dgram();

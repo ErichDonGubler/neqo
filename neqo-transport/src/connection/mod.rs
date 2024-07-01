@@ -46,7 +46,7 @@ use crate::{
     path::{Path, PathRef, Paths},
     qlog,
     quic_datagrams::{DatagramTracking, QuicDatagrams},
-    recovery::{LossRecovery, RecoveryToken, SendProfile},
+    recovery::{LossRecovery, RecoveryToken, SendProfile, SentPacket},
     recv_stream::RecvStreamStats,
     rtt::{RttEstimate, GRANULARITY},
     send_stream::SendStream,
@@ -57,7 +57,7 @@ use crate::{
         self, TransportParameter, TransportParameterId, TransportParameters,
         TransportParametersHandler,
     },
-    tracking::{AckTracker, PacketNumberSpace, RecvdPackets, SentPacket},
+    tracking::{AckTracker, PacketNumberSpace, RecvdPackets},
     version::{Version, WireVersion},
     AppError, CloseReason, Error, Res, StreamId,
 };
@@ -216,12 +216,10 @@ impl AddressValidationInfo {
 ///
 /// For the life of the connection, handle activity in the following manner:
 /// 1. Perform operations using the `stream_*()` methods.
-/// 1. Call `process_input()` when a datagram is received or the timer
-/// expires. Obtain information on connection state changes by checking
-/// `events()`.
-/// 1. Having completed handling current activity, repeatedly call
-/// `process_output()` for packets to send, until it returns `Output::Callback`
-/// or `Output::None`.
+/// 1. Call `process_input()` when a datagram is received or the timer expires. Obtain information
+///    on connection state changes by checking `events()`.
+/// 1. Having completed handling current activity, repeatedly call `process_output()` for packets to
+///    send, until it returns `Output::Callback` or `Output::None`.
 ///
 /// After the connection is closed (either by calling `close()` or by the
 /// remote) continue processing until `state()` returns `Closed`.
@@ -1029,8 +1027,7 @@ impl Connection {
             let rtt = path.rtt();
             let pto = rtt.pto(PacketNumberSpace::ApplicationData);
 
-            let keep_alive = self.streams.need_keep_alive();
-            let idle_time = self.idle_timeout.expiry(now, pto, keep_alive);
+            let idle_time = self.idle_timeout.expiry(now, pto);
             qtrace!([self], "Idle/keepalive timer {:?}", idle_time);
             delays.push(idle_time);
 
@@ -1234,7 +1231,6 @@ impl Connection {
                 d.source(),
                 d.destination(),
                 d.tos(),
-                d.ttl(),
                 &d[d.len() - remaining..],
             )
         } else {
@@ -2370,7 +2366,7 @@ impl Connection {
                         packets.len(),
                         mtu
                     );
-                    initial.size += mtu - packets.len();
+                    initial.track_padding(mtu - packets.len());
                     // These zeros aren't padding frames, they are an invalid all-zero coalesced
                     // packet, which is why we don't increase `frame_tx.padding` count here.
                     packets.resize(mtu, 0);
@@ -2894,7 +2890,7 @@ impl Connection {
     /// to retransmit the frame as needed.
     fn handle_lost_packets(&mut self, lost_packets: &[SentPacket]) {
         for lost in lost_packets {
-            for token in &lost.tokens {
+            for token in lost.tokens() {
                 qdebug!([self], "Lost: {:?}", token);
                 match token {
                     RecoveryToken::Ack(_) => {}
@@ -2930,13 +2926,13 @@ impl Connection {
     fn handle_ack<R>(
         &mut self,
         space: PacketNumberSpace,
-        largest_acknowledged: u64,
+        largest_acknowledged: PacketNumber,
         ack_ranges: R,
         ack_ecn: Option<EcnCount>,
         ack_delay: u64,
         now: Instant,
     ) where
-        R: IntoIterator<Item = RangeInclusive<u64>> + Debug,
+        R: IntoIterator<Item = RangeInclusive<PacketNumber>> + Debug,
         R::IntoIter: ExactSizeIterator,
     {
         qdebug!([self], "Rx ACK space={}, ranges={:?}", space, ack_ranges);
@@ -2954,7 +2950,7 @@ impl Connection {
             now,
         );
         for acked in acked_packets {
-            for token in &acked.tokens {
+            for token in acked.tokens() {
                 match token {
                     RecoveryToken::Stream(stream_token) => self.streams.acked(stream_token),
                     RecoveryToken::Ack(at) => self.acks.acked(at),

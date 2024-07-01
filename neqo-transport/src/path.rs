@@ -25,11 +25,11 @@ use crate::{
     ecn::{EcnCount, EcnInfo},
     frame::{FRAME_TYPE_PATH_CHALLENGE, FRAME_TYPE_PATH_RESPONSE, FRAME_TYPE_RETIRE_CONNECTION_ID},
     packet::PacketBuilder,
-    recovery::RecoveryToken,
+    recovery::{RecoveryToken, SentPacket},
     rtt::RttEstimate,
     sender::PacketSender,
     stats::FrameStats,
-    tracking::{PacketNumberSpace, SentPacket},
+    tracking::PacketNumberSpace,
     Stats,
 };
 
@@ -534,8 +534,6 @@ pub struct Path {
     rtt: RttEstimate,
     /// A packet sender for the path, which includes congestion control and a pacer.
     sender: PacketSender,
-    /// The IP TTL to use for outgoing packets on this path.
-    ttl: u8,
 
     /// The number of bytes received on this path.
     /// Note that this value might saturate on a long-lived connection,
@@ -573,7 +571,6 @@ impl Path {
             challenge: None,
             rtt: RttEstimate::default(),
             sender,
-            ttl: 64, // This is the default TTL on many OSes.
             received_bytes: 0,
             sent_bytes: 0,
             ecn_info: EcnInfo::default(),
@@ -706,8 +703,12 @@ impl Path {
 
     /// Make a datagram.
     pub fn datagram<V: Into<Vec<u8>>>(&mut self, payload: V) -> Datagram {
+        // Make sure to use the TOS value from before calling EcnInfo::on_packet_sent, which may
+        // update the ECN state and can hence change it - this packet should still be sent
+        // with the current value.
+        let tos = self.tos();
         self.ecn_info.on_packet_sent();
-        Datagram::new(self.local, self.remote, self.tos(), Some(self.ttl), payload)
+        Datagram::new(self.local, self.remote, tos, payload)
     }
 
     /// Get local address as `SocketAddr`
@@ -954,12 +955,12 @@ impl Path {
             qinfo!(
                 [self],
                 "discarding a packet without an RTT estimate; guessing RTT={:?}",
-                now - sent.time_sent
+                now - sent.time_sent()
             );
             stats.rtt_init_guess = true;
             self.rtt.update(
                 &mut self.qlog,
-                now - sent.time_sent,
+                now - sent.time_sent(),
                 Duration::new(0, 0),
                 false,
                 now,
